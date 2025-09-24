@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi import Response
 from pydantic import BaseModel
+from typing import List, Optional, Literal
 import asyncio
 import json
 import os
@@ -23,11 +24,21 @@ app.add_middleware(
 )
 
 
+class Message(BaseModel):
+    role: Literal['system', 'user', 'assistant']
+    content: str
+
+
 class ChatRequest(BaseModel):
-    prompt: str
-    model: str | None = None  # optional override
-    latitude: float | None = None
-    longitude: float | None = None
+    # Back-compat single prompt. If provided alongside messages, messages win
+    prompt: Optional[str] = None
+    # New: full message history
+    messages: Optional[List[Message]] = None
+    model: Optional[str] = None  # optional override
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    # If true (or Accept: text/event-stream), respond as SSE frames
+    sse: Optional[bool] = None
 
 
 load_dotenv()
@@ -110,7 +121,7 @@ async def fetch_holidays(country_code: str, year: int, month: int) -> list[dict]
         return [h for h in data if int(h.get("date", "0000-00-00").split("-")[1]) == month]
 
 
-async def openai_stream(prompt: str, model: str | None = None):
+async def openai_stream_messages(messages: List[Message], model: str | None = None):
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set. Create backend/.env with OPENAI_API_KEY=sk-... and restart.")
 
@@ -119,35 +130,45 @@ async def openai_stream(prompt: str, model: str | None = None):
         chosen_model = "gpt-4o-mini"
     else:
         chosen_model = model
-    # Uses Chat Completions with streaming
+    # Use Responses API with streaming
     try:
-        system_msg = f"Current date: {datetime.now().strftime('%Y-%m-%d')}"
-        stream = await client.chat.completions.create(
-            model=chosen_model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
-            stream=True,
-        )
-        async for event in stream:
-            if event.choices and event.choices[0].delta and event.choices[0].delta.content:
-                yield event.choices[0].delta.content
+        # Build input for Responses API
+        input_messages = [
+            {"role": m.role, "content": [{"type": "text", "text": m.content}]} for m in messages
+        ]
+        system_msg = {"role": "system", "content": [{"type": "text", "text": f"Current date: {datetime.now().strftime('%Y-%m-%d')}"}]}
+        input_payload = [system_msg] + input_messages
+
+        async with client.responses.stream(model=chosen_model, input=input_payload) as stream:
+            async for event in stream:
+                if event.type == "response.output_text.delta":
+                    yield event.delta
+                elif event.type == "response.error":
+                    # propagate a readable error downstream
+                    yield f"[error]: {event.error.get('message', 'Unknown error')}\n"
     except Exception as e:
         # Graceful fallback if quota/billing or model access fails
-        yield "[error]: " + str(e) + "\n"
+        # Do not leak raw provider errors to clients
+        yield "[error]: Unable to contact AI provider. Using fallback.\n"
         # simple non-LLM fallback so the UI still works
-        text = f"[{datetime.now().strftime('%Y-%m-%d')}] I cannot call the AI model right now (quota/billing). But here's an echo: {prompt}"
+        text = f"[{datetime.now().strftime('%Y-%m-%d')}] I cannot call the AI model right now (quota/billing)."
         for token in text.split(" "):
             yield token + " "
             await asyncio.sleep(0.03)
 
 
+def _should_sse(req: ChatRequest, request: Request) -> bool:
+    if req.sse is True:
+        return True
+    accept = request.headers.get("accept", "")
+    return "text/event-stream" in accept.lower()
+
+
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: Request):
     async def generator():
         # Light intent: "weather" queries
-        text_lower = req.prompt.lower()
+        text_lower = (req.prompt or "").lower()
         # Holidays intent
         if "holiday" in text_lower:
             month, year = parse_month_year(text_lower)
@@ -175,31 +196,38 @@ async def chat_stream(req: ChatRequest):
                     yield tok + " "
                     await asyncio.sleep(0.005)
             return
-        # Links intent: generate search URLs without external calls
-        if "link" in text_lower or "links" in text_lower:
-            # extract query after keywords like "for" or after colon
+        # Links intent: generate image search provider URLs without external calls
+        if any(k in text_lower for k in [
+            "link", "links", "image", "images", "photo", "photos", "wallpaper", "pic", "pictures"
+        ]):
+            # Extract probable query from the prompt
             q = req.prompt.strip()
             parts = q.split(":", 1)
             if len(parts) > 1 and parts[1].strip():
                 q = parts[1].strip()
             else:
-                kw_parts = q.split(" for ", 1)
-                if len(kw_parts) > 1 and kw_parts[1].strip():
-                    q = kw_parts[1].strip()
-            # cleanup common command words so the search looks right
-            words = [w for w in q.replace("?", " ").replace(".", " ").split() if w]
-            stop = {"give", "me", "link", "links", "please", "a", "an", "the", "for", "this"}
+                for sep in [" for ", " about ", " on ", " of "]:
+                    kw_parts = q.split(sep, 1)
+                    if len(kw_parts) > 1 and kw_parts[1].strip():
+                        q = kw_parts[1].strip()
+                        break
+            # Cleanup common command words so the search looks right
+            words = [w for w in q.replace("?", " ").replace(".", " ").replace("\n", " ").split() if w]
+            stop = {"give", "show", "find", "me", "link", "links", "please", "a", "an", "the", "for", "this", "these", "to", "get"}
             cleaned = " ".join([w for w in words if w.lower() not in stop]).strip()
             if not cleaned:
                 cleaned = q.strip()
             import urllib.parse
-            enc = urllib.parse.quote_plus(cleaned)
+            enc_path = urllib.parse.quote(cleaned)
+            enc_plus = urllib.parse.quote_plus(cleaned)
+            # Strictly match the required output format: only @-prefixed lines, no header
             lines = [
-                "Here are some links you can try:\n",
-                f"- Google: https://www.google.com/search?q={enc}\n",
-                f"- Bing: https://www.bing.com/search?q={enc}\n",
-                f"- DuckDuckGo: https://duckduckgo.com/?q={enc}\n",
-                f"- Wikipedia search: https://en.wikipedia.org/w/index.php?search={enc}\n",
+                f"@https://unsplash.com/s/photos/{enc_path}\n",
+                f"@https://www.pexels.com/search/{enc_path}/\n",
+                f"@https://pixabay.com/images/search/{enc_path}/\n",
+                f"@https://www.freepik.com/search?format=search&query={enc_plus}\n",
+                f"@https://www.istockphoto.com/photos/{enc_path}\n",
+                f"@https://www.gettyimages.com/photos/{enc_path}\n",
             ]
             for line in lines:
                 for tok in line.split(" "):
@@ -224,17 +252,28 @@ async def chat_stream(req: ChatRequest):
             return
 
         try:
-            async for token in openai_stream(req.prompt, req.model):
-                yield token
+            # Build messages array: prefer provided messages; else wrap prompt
+            msgs = req.messages if req.messages else [Message(role='user', content=req.prompt or "")]
+            sse_mode = _should_sse(req, request)
+            if sse_mode:
+                # SSE frames
+                async def sse_line(data: str) -> str:
+                    return f"data: {data}\n\n"
+                async for token in openai_stream_messages(msgs, req.model):
+                    yield await sse_line(token)
+            else:
+                async for token in openai_stream_messages(msgs, req.model):
+                    yield token
         except Exception as e:
             yield f"\n[error]: {str(e)}\n"
-    return StreamingResponse(generator(), media_type="text/plain")
+    media = "text/event-stream" if _should_sse(req, request) else "text/plain"
+    return StreamingResponse(generator(), media_type=media)
 
 
 # Alias single endpoint as required: POST /chat (streaming response)
 @app.post("/chat")
-async def chat(req: ChatRequest):
-    return await chat_stream(req)
+async def chat(req: ChatRequest, request: Request):
+    return await chat_stream(req, request)
 
 
 @app.get("/")
