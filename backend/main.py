@@ -43,7 +43,14 @@ class ChatRequest(BaseModel):
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # e.g., https://openrouter.ai/api/v1 or Azure endpoint
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+client = None
+if OPENAI_API_KEY:
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL) if OPENAI_BASE_URL else AsyncOpenAI(api_key=OPENAI_API_KEY)
+    except Exception as _e:
+        client = None
 async def fetch_weather(city: str | None = None, lat: float | None = None, lon: float | None = None) -> str:
     # Free, no-key alternative: Open-Meteo
     async with httpx.AsyncClient(timeout=10) as http:
@@ -123,11 +130,11 @@ async def fetch_holidays(country_code: str, year: int, month: int) -> list[dict]
 
 async def openai_stream_messages(messages: List[Message], model: str | None = None):
     if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set. Create backend/.env with OPENAI_API_KEY=sk-... and restart.")
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set on server")
 
     # Some clients (e.g., Swagger default) send literal "string"; treat as unset
     if model is None or model.strip() == "" or model.strip().lower() == "string":
-        chosen_model = "gpt-4o-mini"
+        chosen_model = DEFAULT_OPENAI_MODEL
     else:
         chosen_model = model
     # Use Responses API with streaming
@@ -139,17 +146,53 @@ async def openai_stream_messages(messages: List[Message], model: str | None = No
         system_msg = {"role": "system", "content": [{"type": "text", "text": f"Current date: {datetime.now().strftime('%Y-%m-%d')}"}]}
         input_payload = [system_msg] + input_messages
 
-        async with client.responses.stream(model=chosen_model, input=input_payload) as stream:
-            async for event in stream:
-                if event.type == "response.output_text.delta":
-                    yield event.delta
-                elif event.type == "response.error":
-                    # propagate a readable error downstream
-                    yield f"[error]: {event.error.get('message', 'Unknown error')}\n"
+        # basic retry with exponential backoff
+        attempts = 0
+        while True:
+            try:
+                async with client.responses.stream(model=chosen_model, input=input_payload) as stream:
+                    async for event in stream:
+                        if event.type == "response.output_text.delta":
+                            yield event.delta
+                        elif event.type == "response.error":
+                            yield f"[error]: {event.error.get('message', 'Unknown error')}\n"
+                break
+            except Exception as inner:
+                attempts += 1
+                if attempts >= 2:
+                    # Safe fallback to Chat Completions streaming for accounts without Responses access
+                    try:
+                        legacy_msgs = []
+                        for m in input_payload:
+                            role = m.get('role')
+                            # concatenate text parts only
+                            parts = m.get('content', [])
+                            text = " ".join([p.get('text', '') for p in parts if isinstance(p, dict)])
+                            legacy_msgs.append({"role": role, "content": text})
+                        legacy_msgs = [mm for mm in legacy_msgs if mm.get('content')]
+                        stream = await client.chat.completions.create(
+                            model=chosen_model,
+                            messages=legacy_msgs,
+                            stream=True,
+                        )
+                        async for ev in stream:
+                            if ev.choices and ev.choices[0].delta and ev.choices[0].delta.content:
+                                yield ev.choices[0].delta.content
+                        break
+                    except Exception as inner2:
+                        raise inner2
+                await asyncio.sleep(0.5 * attempts)
     except Exception as e:
+        # Log the provider error for operators, but keep client output generic
+        try:
+            print("[openai_error]", str(e))
+        except Exception:
+            pass
         # Graceful fallback if quota/billing or model access fails
         # Do not leak raw provider errors to clients
-        yield "[error]: Unable to contact AI provider. Using fallback.\n"
+        # Return a short sanitized error type if available
+        err_type = type(e).__name__
+        yield f"[error]: Provider failure ({err_type}). Using fallback.\n"
         # simple non-LLM fallback so the UI still works
         text = f"[{datetime.now().strftime('%Y-%m-%d')}] I cannot call the AI model right now (quota/billing)."
         for token in text.split(" "):
@@ -279,6 +322,13 @@ async def chat(req: ChatRequest, request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
+@app.get("/health/openai")
+async def health_openai():
+    has_key = bool(OPENAI_API_KEY)
+    base = OPENAI_BASE_URL or "https://api.openai.com/v1"
+    model = DEFAULT_OPENAI_MODEL
+    return {"api_key": has_key, "base_url": base, "model": model}
 
 # (image endpoints removed)
 
