@@ -1,4 +1,4 @@
-# FastAPI backend for AI Q&A (streaming)
+# FastAPI backend for AI Q&A Chat (streaming)
 
 ## Setup
 
@@ -20,4 +20,5 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ## Replace fake LLM
 - Swap `fake_llm_stream` with your actual generator producing token strings.
+
 
