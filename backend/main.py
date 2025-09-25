@@ -210,8 +210,14 @@ def _should_sse(req: ChatRequest, request: Request) -> bool:
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
     async def generator():
-        # Light intent: "weather" queries
-        text_lower = (req.prompt or "").lower()
+        # Get the actual text to check for intents
+        if req.messages and len(req.messages) > 0:
+            # Use the last user message content
+            last_user_msg = next((msg for msg in reversed(req.messages) if msg.role == 'user'), None)
+            text_lower = (last_user_msg.content if last_user_msg else "").lower()
+        else:
+            # Use prompt if no messages
+            text_lower = (req.prompt or "").lower()
         # Holidays intent
         if "holiday" in text_lower:
             month, year = parse_month_year(text_lower)
@@ -240,11 +246,27 @@ async def chat_stream(req: ChatRequest, request: Request):
                     await asyncio.sleep(0.005)
             return
         # Links intent: generate image search provider URLs without external calls
-        if any(k in text_lower for k in [
-            "link", "links", "image", "images", "photo", "photos", "wallpaper", "pic", "pictures"
-        ]):
-            # Extract probable query from the prompt
-            q = req.prompt.strip()
+        # Only trigger for explicit image/link requests with clear patterns
+        explicit_keywords = ["link", "links", "image", "images", "photo", "photos", "wallpaper", "pic", "pictures"]
+        has_explicit_keyword = any(k in text_lower for k in explicit_keywords)
+        
+        # Check for explicit patterns that clearly indicate image/link requests
+        import re
+        explicit_patterns = [
+            r"(give|show|find|get)\s+.*\s+(image|photo|picture)s?\s+link",
+            r"(show|find|get)\s+(me\s+)?(image|photo|picture)s?\s+of",
+            r"(image|photo|picture)s?\s+(of|for)\s+",
+            r"wallpaper\s+(of|for)\s+",
+        ]
+        matches_explicit_pattern = any(re.search(pattern, text_lower) for pattern in explicit_patterns)
+        
+        if has_explicit_keyword and matches_explicit_pattern:
+            # Extract probable query from the prompt or last user message
+            if req.messages and len(req.messages) > 0:
+                last_user_msg = next((msg for msg in reversed(req.messages) if msg.role == 'user'), None)
+                q = (last_user_msg.content if last_user_msg else "").strip()
+            else:
+                q = req.prompt.strip()
             parts = q.split(":", 1)
             if len(parts) > 1 and parts[1].strip():
                 q = parts[1].strip()
